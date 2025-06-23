@@ -7,7 +7,7 @@ from transformer import Transformer
 
 # Constants
 EPOCHS = 10
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 DATA_PATH = "dataset.json"
 MAX_POSITIONS_IN_POSITIONAL_ENCODING = 4000
 
