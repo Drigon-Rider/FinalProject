@@ -5,16 +5,17 @@ from melodygenerator import MelodyGenerator
 from melodypreprocessor import MelodyPreprocessor
 from transformer import Transformer
 
+# Constants
 EPOCHS = 10
 BATCH_SIZE = 32
 DATA_PATH = "dataset.json"
 MAX_POSITIONS_IN_POSITIONAL_ENCODING = 100
 
-sparse_categorical_crossentropy = SparseCategoricalCrossentropy(
-    from_logits=True, reduction="none"
-)
+# Loss and optimizer
+sparse_categorical_crossentropy = SparseCategoricalCrossentropy(from_logits=True, reduction="none")
 optimizer = Adam()
 
+# Training loop
 def train(train_dataset, transformer, epochs):
     print("Training the model...")
     for epoch in range(epochs):
@@ -22,41 +23,45 @@ def train(train_dataset, transformer, epochs):
         for (batch, (input, target)) in enumerate(train_dataset):
             batch_loss = _train_step(input, target, transformer)
             total_loss += batch_loss
-            print(
-                f"Epoch {epoch + 1} Batch {batch + 1} Loss {batch_loss.numpy()}"
-            )
+            print(f"Epoch {epoch + 1} Batch {batch + 1} Loss {batch_loss.numpy()}")
 
+# One training step (corrected)
 @tf.function
 def _train_step(input, target, transformer):
     target_input = _right_pad_sequence_once(target[:, :-1])
     target_real = _right_pad_sequence_once(target[:, 1:])
     with tf.GradientTape() as tape:
-        predictions = transformer(input, target_input, True, None, None, None)
+        predictions = transformer(
+            input,
+            target_input,
+            training=True,
+            enc_padding_mask=None,
+            look_ahead_mask=None,
+            dec_padding_mask=None
+        )
         loss = _calculate_loss(target_real, predictions)
     gradients = tape.gradient(loss, transformer.trainable_variables)
-    gradient_variable_pairs = zip(gradients, transformer.trainable_variables)
-    optimizer.apply_gradients(gradient_variable_pairs)
+    optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
     return loss
 
+# Loss masking
 def _calculate_loss(real, pred):
     loss_ = sparse_categorical_crossentropy(real, pred)
-    boolean_mask = tf.math.equal(real, 0)
-    mask = tf.math.logical_not(boolean_mask)
-    mask = tf.cast(mask, dtype=loss_.dtype)
+    mask = tf.cast(tf.not_equal(real, 0), dtype=loss_.dtype)
     loss_ *= mask
-    total_loss = tf.reduce_sum(loss_)
-    number_of_non_padded_elements = tf.reduce_sum(mask)
-    average_loss = total_loss / number_of_non_padded_elements
-    return average_loss
+    return tf.reduce_sum(loss_) / tf.reduce_sum(mask)
 
+# Pad 1 zero at the end
 def _right_pad_sequence_once(sequence):
     return tf.pad(sequence, [[0, 0], [0, 1]], "CONSTANT")
 
+# Model checkpoint saving
 def save_model(transformer, optimizer, checkpoint_path="transformer_ckpt"):
     ckpt = tf.train.Checkpoint(transformer=transformer, optimizer=optimizer)
     ckpt.save(checkpoint_path)
     print(f"Model saved at {checkpoint_path}")
 
+# Load saved checkpoint
 def load_model(transformer, optimizer, checkpoint_path="transformer_ckpt"):
     ckpt = tf.train.Checkpoint(transformer=transformer, optimizer=optimizer)
     latest_ckpt = tf.train.latest_checkpoint('.')
@@ -66,10 +71,14 @@ def load_model(transformer, optimizer, checkpoint_path="transformer_ckpt"):
     else:
         print("No checkpoint found.")
 
+# Main execution
 if __name__ == "__main__":
+    # Load and prepare data
     melody_preprocessor = MelodyPreprocessor(DATA_PATH, batch_size=BATCH_SIZE)
     train_dataset = melody_preprocessor.create_training_dataset()
     vocab_size = melody_preprocessor.number_of_tokens_with_padding
+
+    # Define transformer model
     transformer_model = Transformer(
         num_layers=2,
         d_model=64,
@@ -81,12 +90,18 @@ if __name__ == "__main__":
         max_num_positions_in_pe_decoder=MAX_POSITIONS_IN_POSITIONAL_ENCODING,
         dropout_rate=0.1,
     )
+
+    # Start training
     train(train_dataset, transformer_model, EPOCHS)
+
+    # Save model weights
     transformer_model.save_weights("transformer_weights.h5")
     print("Model weights saved.")
-    melody_generator = MelodyGenerator(
-        transformer_model, melody_preprocessor.tokenizer
-    )
-    # start_sequence = ["C4-1.0", "D4-1.0", "E4-1.0", "C4-1.0"]
+
+    # Ready melody generator for future inference
+    melody_generator = MelodyGenerator(transformer_model, melody_preprocessor.tokenizer)
+
+    # To use:
+    # start_sequence = ["C4-1.0", "D4-1.0", "E4-1.0"]
     # new_melody = melody_generator.generate(start_sequence)
     # print(f"Generated melody: {new_melody}")
