@@ -1,7 +1,7 @@
 import json
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.preprocessing.text import Tokenizer
+from keras.preprocessing.text import Tokenizer
 
 class MelodyPreprocessor:
 
