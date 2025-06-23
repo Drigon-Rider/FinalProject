@@ -1,207 +1,99 @@
+import json
 import numpy as np
 import tensorflow as tf
-from keras.layers import (
-    Dense,
-    Dropout,
-    Embedding,
-    LayerNormalization,
-    MultiHeadAttention,
-)
+from tensorflow.keras.preprocessing.text import Tokenizer
 
-def sinusoidal_position_encoding(num_positions, d_model):
-    angles = _get_angles(
-        np.arange(num_positions)[:, np.newaxis],
-        np.arange(d_model)[np.newaxis, :],
-        d_model,
-    )
-    sines = np.sin(angles[:, 0::2])
-    cosines = np.cos(angles[:, 1::2])
-    pos_encoding = np.concatenate([sines, cosines], axis=-1)
-    return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
+class MelodyPreprocessor:
 
-def _get_angles(pos, i, d_model):
-    angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
-    return pos * angle_rates
+    def __init__(self, dataset_path, batch_size=32):
+        self.dataset_path = dataset_path
+        self.batch_size = batch_size
+        self.tokenizer = Tokenizer(filters="", lower=False, split=",")
+        self.max_melody_length = None
+        self.number_of_tokens = None
 
-class Transformer(tf.keras.Model):
-    def __init__(
-        self,
-        num_layers,
-        d_model,
-        num_heads,
-        d_feedforward,
-        input_vocab_size,
-        target_vocab_size,
-        max_num_positions_in_pe_encoder,
-        max_num_positions_in_pe_decoder,
-        dropout_rate=0.1,
-    ):
-        super(Transformer, self).__init__()
-        self.encoder = Encoder(
-            num_layers, d_model, num_heads, d_feedforward,
-            input_vocab_size, max_num_positions_in_pe_encoder, dropout_rate
+    @property
+    def number_of_tokens_with_padding(self):
+        return self.number_of_tokens + 1
+
+    def create_training_dataset(self):
+        dataset = self._load_dataset()
+        parsed_melodies = [self._parse_melody(melody) for melody in dataset]
+        tokenized_melodies = self._tokenize_and_encode_melodies(parsed_melodies)
+        self._set_max_melody_length(tokenized_melodies)
+        self._set_number_of_tokens()
+        tf_training_dataset = self._convert_to_tf_dataset(tokenized_melodies)
+        return tf_training_dataset
+
+    def _load_dataset(self):
+        with open(self.dataset_path, "r") as f:
+            return json.load(f)
+
+    def _parse_melody(self, melody_str):
+        return melody_str.split(", ")
+
+    def _tokenize_and_encode_melodies(self, melodies):
+        self.tokenizer.fit_on_texts(melodies)
+        tokenized_melodies = self.tokenizer.texts_to_sequences(melodies)
+        return tokenized_melodies
+
+    def _set_max_melody_length(self, melodies):
+         self.max_melody_length = max(len(melody) for melody in melodies)
+
+    def _set_number_of_tokens(self):
+        self.number_of_tokens = len(self.tokenizer.word_index)
+
+    def _sequence_pair_generator(self, melodies):
+        for melody in melodies:
+            for i in range(1, len(melody)):
+                input_seq = melody[:i]
+                target_seq = melody[1 : i + 1]
+                yield input_seq, target_seq
+
+    def _convert_to_tf_dataset(self, melodies):
+        output_signature = (
+            tf.TensorSpec(shape=(None,), dtype=tf.int32),
+            tf.TensorSpec(shape=(None,), dtype=tf.int32),
         )
-        self.decoder = Decoder(
-            num_layers, d_model, num_heads, d_feedforward,
-            target_vocab_size, max_num_positions_in_pe_decoder, dropout_rate
+        dataset = tf.data.Dataset.from_generator(
+            lambda: self._sequence_pair_generator(melodies),
+            output_signature=output_signature,
         )
-        self.final_layer = Dense(target_vocab_size)
-
-    def call(
-        self,
-        input,
-        target,
-        *,
-        training=False,
-        enc_padding_mask=None,
-        look_ahead_mask=None,
-        dec_padding_mask=None,
-    ):
-        enc_output = self.encoder(input, training=training, mask=enc_padding_mask)
-        dec_output = self.decoder(
-            target, enc_output, training=training,
-            look_ahead_mask=look_ahead_mask, padding_mask=dec_padding_mask
+        dataset = dataset.shuffle(1000)
+        dataset = dataset.padded_batch(
+            self.batch_size,
+            padded_shapes=([self.max_melody_length], [self.max_melody_length]),
+            padding_values=(0, 0),
         )
-        return self.final_layer(dec_output)
+        return dataset
 
-class Encoder(tf.keras.layers.Layer):
-    def __init__(
-        self,
-        num_layers, d_model, num_heads, d_feedforward,
-        input_vocab_size, maximum_positions_in_pe, dropout_rate=0.1,
-    ):
-        super(Encoder, self).__init__()
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.embedding = Embedding(input_vocab_size, d_model)
-        self.pos_encoding = sinusoidal_position_encoding(maximum_positions_in_pe, d_model)
-        self.enc_layers = [
-            EncoderLayer(d_model, num_heads, d_feedforward, dropout_rate)
-            for _ in range(num_layers)
-        ]
-        self.dropout = Dropout(dropout_rate)
+    def fit_tokenizer(self):
+        dataset = self._load_dataset()
+        parsed_melodies = [self._parse_melody(melody) for melody in dataset]
+        self.tokenizer.fit_on_texts(parsed_melodies)
+        self.number_of_tokens = len(self.tokenizer.word_index)
 
-    def call(self, x, *, training=False, mask=None):
-        x = self.embedding(x)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :x.shape[1], :]
-        x = self.dropout(x, training=training)
-        for i in range(self.num_layers):
-            x = self.enc_layers[i](x, training=training, mask=mask)
-        return x
-
-class Decoder(tf.keras.layers.Layer):
-    def __init__(
-        self,
-        num_layers, d_model, num_heads, d_feedforward,
-        target_vocab_size, maximum_positions_in_pe, dropout_rate=0.1,
-    ):
-        super(Decoder, self).__init__()
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.embedding = Embedding(target_vocab_size, d_model)
-        self.pos_encoding = sinusoidal_position_encoding(maximum_positions_in_pe, d_model)
-        self.dec_layers = [
-            DecoderLayer(d_model, num_heads, d_feedforward, dropout_rate)
-            for _ in range(num_layers)
-        ]
-        self.dropout = Dropout(dropout_rate)
-
-    def call(
-        self, x, enc_output, *,
-        training=False, look_ahead_mask=None, padding_mask=None
-    ):
-        x = self.embedding(x)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :x.shape[1], :]
-        x = self.dropout(x, training=training)
-        for i in range(self.num_layers):
-            x = self.dec_layers[i](
-                x, enc_output, training=training,
-                look_ahead_mask=look_ahead_mask, padding_mask=padding_mask
-            )
-        return x
-
-class EncoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, d_feedforward, dropout_rate=0.1):
-        super(EncoderLayer, self).__init__()
-        self.mha = MultiHeadAttention(key_dim=d_model, num_heads=num_heads)
-        self.ffn = tf.keras.Sequential([
-            Dense(d_feedforward, activation="relu"),
-            Dense(d_model),
-        ])
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
-        self.dropout1 = Dropout(dropout_rate)
-        self.dropout2 = Dropout(dropout_rate)
-
-    def call(self, x, *, training=False, mask=None):
-        attn_output = self.mha(x, x, x, attention_mask=mask)
-        out1 = self.layernorm1(x + self.dropout1(attn_output, training=training))
-        ffn_output = self.ffn(out1)
-        out2 = self.layernorm2(out1 + self.dropout2(ffn_output, training=training))
-        return out2
-
-class DecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, d_feedforward, dropout_rate=0.1):
-        super(DecoderLayer, self).__init__()
-        self.mha1 = MultiHeadAttention(key_dim=d_model, num_heads=num_heads)
-        self.mha2 = MultiHeadAttention(key_dim=d_model, num_heads=num_heads)
-        self.ffn = tf.keras.Sequential([
-            Dense(d_feedforward, activation="relu"),
-            Dense(d_model),
-        ])
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
-        self.layernorm3 = LayerNormalization(epsilon=1e-6)
-        self.dropout1 = Dropout(dropout_rate)
-        self.dropout2 = Dropout(dropout_rate)
-        self.dropout3 = Dropout(dropout_rate)
-
-    def call(
-        self, x, enc_output, *,
-        training=False, look_ahead_mask=None, padding_mask=None
-    ):
-        attn1 = self.mha1(x, x, x, attention_mask=look_ahead_mask)
-        out1 = self.layernorm1(x + self.dropout1(attn1, training=training))
-        attn2 = self.mha2(out1, enc_output, enc_output, attention_mask=padding_mask)
-        out2 = self.layernorm2(out1 + self.dropout2(attn2, training=training))
-        ffn_output = self.ffn(out2)
-        out3 = self.layernorm3(out2 + self.dropout3(ffn_output, training=training))
-        return out3
+def tokens_to_midi(tokens, output_path="output.mid"):
+        """
+        Converts a list of tokens (e.g., ['C4-1.0', 'E4-1.0']) to a MIDI file.
+        """
+        from music21 import stream, note
+    
+        midi_stream = stream.Stream()
+        for token in tokens:
+            try:
+                pitch, duration = token.split('-')
+                n = note.Note(pitch)
+                n.quarterLength = float(duration)
+                midi_stream.append(n)
+            except Exception as e:
+                print(f"Skipping token {token}: {e}")
+    
+        midi_stream.write('midi', fp=output_path)
+        print(f"MIDI file saved as {output_path}")    
 
 if __name__ == "__main__":
-    # Define Transformer parameters
-    num_layers = 2
-    d_model = 64
-    num_heads = 2
-    d_feedforward = 128
-    input_vocab_size = 100
-    target_vocab_size = 100
-    dropout_rate = 0.1
-    pe_input = 100
-    pe_target = 100
-
-    # Instantiate the Transformer model
-    transformer_model = Transformer(
-        num_layers, d_model, num_heads, d_feedforward,
-        input_vocab_size, target_vocab_size, pe_input, pe_target,
-        dropout_rate
-    )
-
-    # Dummy input shapes for encoder and decoder
-    dummy_inp = tf.random.uniform((1, 10), dtype=tf.int64, minval=0, maxval=input_vocab_size)
-    dummy_tar = tf.random.uniform((1, 10), dtype=tf.int64, minval=0, maxval=target_vocab_size)
-
-    # Build and run a forward pass
-    output = transformer_model(
-        dummy_inp,
-        dummy_tar,
-        training=False,
-        enc_padding_mask=None,
-        look_ahead_mask=None,
-        dec_padding_mask=None,
-    )
-
-    # Display summary
-    transformer_model.summary()
+    melody_preprocessor = MelodyPreprocessor("dataset.json", batch_size=32)
+    melody_preprocessor.fit_tokenizer()
+    vocab_size = melody_preprocessor.number_of_tokens_with_padding
+    training_dataset = melody_preprocessor.create_training_dataset()
